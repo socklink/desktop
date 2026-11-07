@@ -1,8 +1,8 @@
-# Sync Desktop
+# SockLink Desktop
 
-A modern, high-performance desktop client for the **Android ↔ Desktop Sync** ecosystem, built with **Tauri v2**, **React 19**, **TypeScript**, and **TanStack Router**. 
+A modern, high-performance desktop client for the **Android ↔ Desktop SockLink** ecosystem, built with **Tauri v2**, **React 19**, **TypeScript**, and **TanStack Router**. 
 
-Sync connects your computer and Android device seamlessly over the local network to enable instant sharing, remote system integration, and universal workspace synchronization.
+SockLink connects your computer and Android device seamlessly over the local network to enable instant sharing, remote system integration, and universal workspace synchronization.
 
 ---
 

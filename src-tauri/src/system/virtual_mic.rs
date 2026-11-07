@@ -35,6 +35,7 @@ fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
 fn play_mic_audio_linux(
     app: AppHandle,
     connect_addr: String,
+    token: String,
     sample_rate: u32,
     channels: u16,
     running: Arc<AtomicBool>,
@@ -102,6 +103,11 @@ fn play_mic_audio_linux(
 
     stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
     stream.set_nodelay(true).ok();
+    // First line authenticates us to the phone's mic server.
+    if std::io::Write::write_all(&mut stream, format!("{token}\n").as_bytes()).is_err() {
+        eprintln!("[virtual_mic] Failed to send stream token");
+        return;
+    }
 
     app.emit(
         "virtual-mic-state-changed",
@@ -178,6 +184,7 @@ fn play_mic_audio_linux(
 fn play_mic_audio_windows(
     app: AppHandle,
     connect_addr: String,
+    token: String,
     sample_rate: u32,
     _channels: u16,
     running: Arc<AtomicBool>,
@@ -279,6 +286,10 @@ fn play_mic_audio_windows(
 
     tcp_stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
     tcp_stream.set_nodelay(true).ok();
+    if std::io::Write::write_all(&mut tcp_stream, format!("{token}\n").as_bytes()).is_err() {
+        eprintln!("[virtual_mic] Failed to send stream token");
+        return;
+    }
 
     app.emit(
         "virtual-mic-state-changed",
@@ -365,6 +376,7 @@ impl VirtualMicrophone {
         sample_rate: u32,
         channels: u16,
         use_adb: bool,
+        token: String,
     ) -> Result<Self, String> {
         #[cfg(not(target_os = "windows"))]
         let (null_sink_id, remap_source_id) = Self::setup_pulse_modules()?;
@@ -394,6 +406,7 @@ impl VirtualMicrophone {
                 play_mic_audio_linux(
                     app,
                     connect_addr,
+                    token,
                     sample_rate,
                     channels,
                     r_clone,
@@ -410,6 +423,7 @@ impl VirtualMicrophone {
                 play_mic_audio_windows(
                     app,
                     connect_addr,
+                    token,
                     sample_rate,
                     channels,
                     r_clone,

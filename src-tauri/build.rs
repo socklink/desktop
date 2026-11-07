@@ -22,7 +22,7 @@ fn ensure_resources() {
         return;
     }
 
-    println!("cargo:warning=[pzync] obs-virtualcam-module64.dll is missing. Attempting automatic setup...");
+    println!("cargo:warning=[socklink] obs-virtualcam-module64.dll is missing. Attempting automatic setup...");
 
     // 1. Try invoking setup-resources.js via node
     if let Ok(status) = Command::new("node").arg("../scripts/setup-resources.js").status() {
@@ -40,7 +40,7 @@ fn ensure_resources() {
     let temp_zip = "resources/obs-temp.zip";
     let dll_zip_path = "data/obs-plugins/win-dshow/obs-virtualcam-module64.dll";
 
-    println!("cargo:warning=[pzync] Downloading OBS Studio to extract virtualcam module...");
+    println!("cargo:warning=[socklink] Downloading OBS Studio to extract virtualcam module...");
     let curl_status = Command::new("curl")
         .args(&["-L", url, "-o", temp_zip])
         .status();
@@ -55,7 +55,7 @@ fn ensure_resources() {
             let extracted = Path::new("resources/data/obs-plugins/win-dshow/obs-virtualcam-module64.dll");
             if extracted.exists() {
                 let _ = std::fs::rename(extracted, dll_path);
-                println!("cargo:warning=[pzync] Successfully installed obs-virtualcam-module64.dll!");
+                println!("cargo:warning=[socklink] Successfully installed obs-virtualcam-module64.dll!");
             }
             let _ = std::fs::remove_dir_all("resources/data");
         }

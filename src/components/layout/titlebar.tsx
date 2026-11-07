@@ -18,12 +18,12 @@ export function Titlebar() {
         <div className="titlebar-logo" data-tauri-drag-region>
           <img
             src={logo}
-            alt="Pzync Logo"
+            alt="SockLink Logo"
             className="titlebar-logo-img"
             data-tauri-drag-region
           />
           <span className="titlebar-logo-text" data-tauri-drag-region>
-            Pzync
+            SockLink
           </span>
         </div>
       </div>

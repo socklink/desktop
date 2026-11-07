@@ -1,4 +1,5 @@
 import fs from 'fs';
+import crypto from 'crypto';
 import path from 'path';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -34,12 +35,22 @@ console.log('[setup-resources] Downloading OBS Studio ZIP to extract the virtual
 
 const tempZip = path.join(__dirname, 'obs-temp.zip');
 const url = 'https://github.com/obsproject/obs-studio/releases/download/30.1.2/OBS-Studio-30.1.2.zip';
+// Pinned SHA-256 of the release asset (size 147393388). Update both together when
+// bumping the OBS version.
+const expectedSha256 = '35be787de3169413eb5e6b6dc8b493c3f1973dd3f8366144b54575f897906dc0';
 const dllZipPath = 'data/obs-plugins/win-dshow/obs-virtualcam-module64.dll';
 
 try {
   // Download the ZIP file using curl
   console.log(`[setup-resources] Downloading from: ${url}`);
-  execSync(`curl -L "${url}" -o "${tempZip}"`, { stdio: 'inherit' });
+  execSync(`curl -fL "${url}" -o "${tempZip}"`, { stdio: 'inherit' });
+
+  // Refuse to use anything that is not the exact artifact we pinned.
+  const actualSha256 = crypto.createHash('sha256').update(fs.readFileSync(tempZip)).digest('hex');
+  if (actualSha256 !== expectedSha256) {
+    throw new Error(`Checksum mismatch for OBS download: expected ${expectedSha256}, got ${actualSha256}`);
+  }
+  console.log('[setup-resources] Checksum verified.');
 
   // Extract the specific DLL using tar
   console.log(`[setup-resources] Extracting ${dllZipPath}...`);

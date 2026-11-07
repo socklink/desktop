@@ -76,42 +76,29 @@ pub async fn set_device_audio_streaming(
         name
     };
 
+    let peer_ip = state.active_ips.lock().unwrap().get(&device_id).copied();
     let mut active_streams = state.active_streams.lock().unwrap();
-    if let Some(stream) = active_streams.get_mut(&device_id) {
+    if let (Some(stream), Some(peer_ip)) = (active_streams.get_mut(&device_id), peer_ip) {
+        use crate::network::protocol::ServerMessage;
         let mut audio_server = state.audio_stream_server.lock().unwrap();
         if enabled {
-            if audio_server.is_none() {
-                match crate::system::audio::AudioStreamServer::start() {
-                    Ok(server) => {
-                        let port = server.port;
-                        *audio_server = Some(server);
-                        let msg = crate::network::protocol::ServerMessage::AudioStreamInfo { enabled: true, port };
-                        let _ = crate::network::protocol::write_line_json(stream, &msg);
-                        
-                        let _ = notify_rust::Notification::new()
-                            .summary("Listen Through Mobile")
-                            .body(&format!("Audio is now streaming to {}", peer_name))
-                            .show();
-                    }
-                    Err(e) => {
-                        eprintln!("[audio] Failed to start audio server: {}", e);
-                        let msg = crate::network::protocol::ServerMessage::AudioStreamInfo { enabled: false, port: 0 };
-                        let _ = crate::network::protocol::write_line_json(stream, &msg);
-                    }
+            match crate::network::session::ensure_audio_server(&mut audio_server, peer_ip) {
+                Some((port, token)) => {
+                    let msg = ServerMessage::AudioStreamInfo { enabled: true, port, token: Some(token) };
+                    let _ = crate::network::protocol::write_line_json(stream, &msg);
+                    let _ = notify_rust::Notification::new()
+                        .summary("Listen Through Mobile")
+                        .body(&format!("Audio is now streaming to {}", peer_name))
+                        .show();
                 }
-            } else {
-                let port = audio_server.as_ref().unwrap().port;
-                let msg = crate::network::protocol::ServerMessage::AudioStreamInfo { enabled: true, port };
-                let _ = crate::network::protocol::write_line_json(stream, &msg);
-                
-                let _ = notify_rust::Notification::new()
-                    .summary("Listen Through Mobile")
-                    .body(&format!("Audio is now streaming to {}", peer_name))
-                    .show();
+                None => {
+                    let msg = ServerMessage::AudioStreamInfo { enabled: false, port: 0, token: None };
+                    let _ = crate::network::protocol::write_line_json(stream, &msg);
+                }
             }
         } else {
             *audio_server = None;
-            let msg = crate::network::protocol::ServerMessage::AudioStreamInfo { enabled: false, port: 0 };
+            let msg = ServerMessage::AudioStreamInfo { enabled: false, port: 0, token: None };
             let _ = crate::network::protocol::write_line_json(stream, &msg);
         }
     }
@@ -243,6 +230,12 @@ pub async fn auto_install_system_dep(app: tauri::AppHandle, feature: String) -> 
                     $zip = "$env:TEMP\VoicemeeterSetup.zip"
                     $dest = "$env:TEMP\VoicemeeterSetup_dir"
                     Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VoicemeeterSetup_v1122.zip" -OutFile $zip
+                    # Only run the installer if the download is exactly the pinned artifact.
+                    $expected = "4D63BFE2A5EAEA8CCF6EA8ABE27C053C05689CCC11BF365130C6B246973BA4FA"
+                    if ((Get-FileHash -Path $zip -Algorithm SHA256).Hash -ne $expected) {
+                        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                        throw "Voicemeeter download failed checksum verification."
+                    }
                     Expand-Archive -Path $zip -DestinationPath $dest -Force
                     $exe = (Get-ChildItem $dest -Filter "*Setup*.exe" | Select-Object -First 1).FullName
                     if ($exe) {

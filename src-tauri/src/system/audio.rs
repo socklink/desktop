@@ -1,5 +1,6 @@
 use std::io::Write;
-use std::net::TcpListener;
+use std::io::Read;
+use std::net::{IpAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -8,6 +9,42 @@ use std::time::Duration;
 pub struct AudioStreamServer {
     running: Arc<AtomicBool>,
     pub port: u16,
+    /// Secret that must be the request path (`GET /<token>`).
+    pub token: String,
+    /// Only this address may connect: the phone that asked for the stream.
+    pub allowed_ip: IpAddr,
+}
+
+/// Read the HTTP request head and require `GET /<token>`.
+fn authorize(socket: &mut std::net::TcpStream, token: &str) -> bool {
+    socket.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    let mut buf = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    while buf.len() < 2048 && !buf.ends_with(b"\r\n\r\n") {
+        match socket.read(&mut byte) {
+            Ok(1) => buf.push(byte[0]),
+            _ => break,
+        }
+    }
+    let head = String::from_utf8_lossy(&buf);
+    let path = head
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("GET /"))
+        .and_then(|l| l.split(' ').next())
+        .unwrap_or("");
+    let ok = path.len() == token.len()
+        && path
+            .bytes()
+            .zip(token.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+    if ok {
+        socket.set_read_timeout(None).ok();
+    } else {
+        let _ = socket.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    }
+    ok
 }
 
 fn wav_header(sample_rate: u32, channels: u16) -> [u8; 44] {
@@ -306,7 +343,7 @@ fn stream_audio_windows(mut socket: std::net::TcpStream, running: Arc<AtomicBool
 }
 
 impl AudioStreamServer {
-    pub fn start() -> Result<Self, String> {
+    pub fn start(allowed_ip: IpAddr) -> Result<Self, String> {
         #[cfg(target_os = "windows")]
         {
             use cpal::traits::{DeviceTrait, HostTrait};
@@ -324,6 +361,15 @@ impl AudioStreamServer {
         listener.set_nonblocking(true).map_err(|e| format!("Set nonblocking failed: {e}"))?;
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
+        let token: String = {
+            use rand::RngExt as _;
+            rand::rng()
+                .sample_iter(&rand::distr::Alphanumeric)
+                .take(43)
+                .map(char::from)
+                .collect()
+        };
+        let token_for_thread = token.clone();
 
         thread::spawn(move || {
             loop {
@@ -331,13 +377,22 @@ impl AudioStreamServer {
                     break;
                 }
                 match listener.accept() {
-                    Ok((socket, addr)) => {
+                    Ok((mut socket, addr)) => {
+                        if addr.ip() != allowed_ip {
+                            eprintln!("[audio] Rejected connection from {addr}");
+                            continue;
+                        }
                         socket.set_nonblocking(false).ok();
                         socket.set_nodelay(true).ok();
-                        println!("[audio] Client connected from {addr}");
 
                         let r_clone = running_clone.clone();
+                        let token = token_for_thread.clone();
                         thread::spawn(move || {
+                            if !authorize(&mut socket, &token) {
+                                eprintln!("[audio] Rejected unauthenticated request from {addr}");
+                                return;
+                            }
+                            println!("[audio] Client connected from {addr}");
                             #[cfg(not(target_os = "windows"))]
                             stream_audio_linux(socket, r_clone);
 
@@ -359,7 +414,7 @@ impl AudioStreamServer {
         });
 
         println!("[audio] AudioStreamServer started on port {port}");
-        Ok(Self { running, port })
+        Ok(Self { running, port, token, allowed_ip })
     }
 }
 

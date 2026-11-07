@@ -14,6 +14,7 @@ pub mod pairing;
 pub mod protocol;
 pub mod session;
 pub mod tcp;
+pub mod tls;
 
 /// Default UDP port used for the discovery broadcast.
 pub const DEFAULT_DISCOVERY_PORT: u16 = 8200;

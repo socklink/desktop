@@ -37,3 +37,8 @@ release/windows/
 
 # Third-party resources downloaded during build
 src-tauri/resources/obs-virtualcam-module64.dll
+# Third-party binaries / test artifacts (download + verify at build time instead)
+installer.exe
+OBS-Virtualcam-*.zip
+temp-dll/
+test.txt.sig

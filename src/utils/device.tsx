@@ -5,6 +5,7 @@ export type PairRequest = {
   deviceId: string
   name: string
   code: string
+  ip: string
 }
 
 export type TrustedPeer = {

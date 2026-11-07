@@ -40,6 +40,8 @@ pub struct AppState {
     pub broadcasting: Arc<AtomicBool>,
     pub active_connections: Arc<Mutex<HashSet<String>>>,
     pub active_streams: Arc<Mutex<HashMap<String, std::net::TcpStream>>>,
+    /// Real (pre-proxy) IP of each connected peer.
+    pub active_ips: Arc<Mutex<HashMap<String, std::net::IpAddr>>>,
     pub last_clipboard: Arc<Mutex<String>>,
     pub copied_files: Arc<Mutex<Vec<String>>>,
     /// Serializes all OS-level clipboard access (polling thread vs image writes).
@@ -68,6 +70,7 @@ impl AppState {
 fn start_background_services(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
     let device_id = get_or_create_device_id(app)?;
     let name = get_system_name().unwrap_or_else(|| "Desktop".to_string());
+    network::tls::init(app)?;
 
     network::discovery::start_broadcast(
         DEFAULT_DISCOVERY_PORT,
@@ -86,6 +89,7 @@ fn start_background_services(app: &tauri::AppHandle, state: &AppState) -> Result
             pairing: state.pairing.clone(),
             active_connections: state.active_connections.clone(),
             active_streams: state.active_streams.clone(),
+            active_ips: state.active_ips.clone(),
             last_clipboard: state.last_clipboard.clone(),
             clipboard_lock: state.clipboard_lock.clone(),
         },
@@ -381,189 +385,135 @@ pub fn disconnect_peer(device_id: &str, state: &AppState) {
         .remove(device_id);
 }
 
-/// Read a file from disk, encode it as Base64 streamingly, and send it to the
-/// specified peer over their active TCP stream.
+/// Raw bytes per `FileChunk` message (about 340 KB once base64-encoded).
+const FILE_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Outgoing files are sent one at a time.
+static SEND_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_TRANSFER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stream a file to the specified peer as a series of small chunk messages.
+/// Chunks are ordinary protocol lines, so other traffic is never blocked behind
+/// the transfer and a stalled peer fails on a write timeout instead of hanging.
 fn send_file_to_device(path_str: &str, device_id: &str, _state: &AppState, app: &AppHandle) {
     let path_str = path_str.to_string();
     let device_id = device_id.to_string();
     let app_clone = app.clone();
 
     std::thread::spawn(move || {
+        let _one_at_a_time = SEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let state = app_clone.state::<AppState>();
-        let path = std::path::Path::new(&path_str);
-        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        
-        let metadata = match std::fs::metadata(path) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[file] Failed to get metadata for '{}': {}", path_str, e);
-                return;
-            }
-        };
-        let file_size = metadata.len();
-
-        let mut file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("[file] Failed to open '{}': {}", path_str, e);
-                return;
-            }
-        };
-
-        // Calculate SHA-256 streamingly
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        let mut buffer = vec![0u8; 65536];
-        loop {
-            use std::io::Read;
-            match file.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => hasher.update(&buffer[..n]),
-                Err(e) => {
-                    eprintln!("[file] Failed to read for hash calculation: {}", e);
-                    return;
-                }
-            }
+        let result = send_file_chunks(&path_str, &device_id, &state, &app_clone);
+        if let Err(e) = result {
+            eprintln!("[file] Sending '{}' failed: {}", path_str, e);
         }
-        let sha256 = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
-
-        // Reset file cursor to start
-        use std::io::Seek;
-        if let Err(e) = file.seek(std::io::SeekFrom::Start(0)) {
-            eprintln!("[file] Failed to seek file: {}", e);
-            return;
-        }
-
-        // Pre-calculate total payload bytes of the IncomingFile message.
-        let escaped_filename = serde_json::to_string(&file_name).unwrap_or_else(|_| format!("\"{}\"", file_name));
-        let escaped_filename_raw = if escaped_filename.starts_with('"') && escaped_filename.ends_with('"') {
-            &escaped_filename[1..escaped_filename.len() - 1]
-        } else {
-            &escaped_filename
-        };
-        let base64_len = ((file_size + 2) / 3) * 4;
-        let total_payload_bytes = 36 + escaped_filename_raw.len() + 17 + base64_len as usize + 12 + 64 + 2;
-
-        // Send FileTransferStart
-        let start_msg = crate::network::protocol::ServerMessage::FileTransferStart {
-            filename: file_name.clone(),
-            total_bytes: total_payload_bytes as u64,
-        };
-
-        // Get the stream and send start
-        {
-            let active_streams = state.active_streams.clone();
-            let mut streams_guard = active_streams.lock().unwrap();
-            let stream = match streams_guard.get_mut(&device_id) {
-                Some(s) => s,
-                None => {
-                    eprintln!("[file] No active stream for device {}", device_id);
-                    return;
-                }
-            };
-
-            if let Err(e) = crate::network::protocol::write_line_json(stream, &start_msg) {
-                eprintln!("[file] Failed to send FileTransferStart: {}", e);
-                return;
-            }
-        }
-
-        // Update active transfer state on desktop
-        {
-            let mut transfer = state.active_transfer.lock().unwrap();
-            *transfer = Some(TransferProgress {
-                device_id: device_id.clone(),
-                filename: file_name.clone(),
-                bytes_received: 0,
-                total_bytes: total_payload_bytes as u64,
-                speed_bytes_per_sec: 0.0,
-                status: "Sending".to_string(),
-            });
-        }
-        let _ = refresh_tray_menu(&app_clone);
-        let _ = app_clone.emit("file-transfer-started", &device_id);
-
-        // Send prefix, stream base64 data, then suffix
-        let active_streams = state.active_streams.clone();
-        let mut streams_guard = active_streams.lock().unwrap();
-        let stream = match streams_guard.get_mut(&device_id) {
-            Some(s) => s,
-            None => {
-                eprintln!("[file] Connection lost for device {}", device_id);
-                reset_active_transfer(&state, &app_clone, &device_id);
-                return;
-            }
-        };
-
-        let prefix = format!(
-            "{{\"type\":\"IncomingFile\",\"filename\":\"{}\",\"base64_data\":\"",
-            escaped_filename_raw
-        );
-        use std::io::Write;
-        if let Err(e) = stream.write_all(prefix.as_bytes()) {
-            eprintln!("[file] Failed to write prefix: {}", e);
-            drop(streams_guard);
-            reset_active_transfer(&state, &app_clone, &device_id);
-            return;
-        }
-
-        let start_time = std::time::Instant::now();
-        let mut total_bytes_sent = 0;
-        let mut error_occurred = false;
-
-        // Use base64 EncoderWriter to encode on the fly
-        use base64::engine::general_purpose::STANDARD;
-        {
-            let mut encoder = base64::write::EncoderWriter::new(&mut *stream, &STANDARD);
-            loop {
-                use std::io::Read;
-                match file.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Err(e) = encoder.write_all(&buffer[..n]) {
-                            eprintln!("[file] Write error during streaming: {}", e);
-                            error_occurred = true;
-                            break;
-                        }
-                        total_bytes_sent += n as u64;
-                        
-                        let current_base64_sent = ((total_bytes_sent + 2) / 3) * 4;
-                        let current_total_sent = prefix.len() as u64 + current_base64_sent;
-                        
-                        update_send_progress(&device_id, current_total_sent, start_time, &state, &app_clone);
-                    }
-                    Err(e) => {
-                        eprintln!("[file] Read error during streaming: {}", e);
-                        error_occurred = true;
-                        break;
-                    }
-                }
-            }
-            if let Err(e) = encoder.finish() {
-                eprintln!("[file] Failed to finish base64 encoding: {}", e);
-                error_occurred = true;
-            }
-        } // encoder is dropped here, releasing borrow on stream
-
-        if error_occurred {
-            drop(streams_guard);
-            reset_active_transfer(&state, &app_clone, &device_id);
-            return;
-        }
-
-        let suffix = format!("\",\"sha256\":\"{}\"}}\n", sha256);
-        if let Err(e) = stream.write_all(suffix.as_bytes()) {
-            eprintln!("[file] Failed to write suffix: {}", e);
-            drop(streams_guard);
-            reset_active_transfer(&state, &app_clone, &device_id);
-            return;
-        }
-        let _ = stream.flush();
-
-        println!("[file] Successfully sent '{}' to {}", file_name, device_id);
-        drop(streams_guard);
         reset_active_transfer(&state, &app_clone, &device_id);
     });
+}
+
+fn send_file_chunks(path_str: &str, device_id: &str, state: &AppState, app: &AppHandle) -> Result<(), String> {
+    use crate::network::protocol::{write_line_json, ServerMessage};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let path = std::path::Path::new(path_str);
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let mut file = std::fs::File::open(path).map_err(|e| format!("open failed: {e}"))?;
+    let file_size = file.metadata().map_err(|e| format!("metadata failed: {e}"))?.len();
+
+    // Own handle on the socket: the shared map lock is not held while sending.
+    let mut stream = {
+        let streams = state.active_streams.lock().unwrap();
+        streams
+            .get(device_id)
+            .ok_or_else(|| format!("no active stream for device {device_id}"))?
+            .try_clone()
+            .map_err(|e| format!("could not clone stream: {e}"))?
+    };
+
+    let transfer_id = format!(
+        "{:x}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        NEXT_TRANSFER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+
+    write_line_json(
+        &mut stream,
+        &ServerMessage::FileStart {
+            transfer_id: transfer_id.clone(),
+            filename: file_name.clone(),
+            total_bytes: file_size,
+        },
+    )?;
+
+    {
+        let mut transfer = state.active_transfer.lock().unwrap();
+        *transfer = Some(TransferProgress {
+            device_id: device_id.to_string(),
+            filename: file_name.clone(),
+            bytes_received: 0,
+            total_bytes: file_size,
+            speed_bytes_per_sec: 0.0,
+            status: "Sending".to_string(),
+        });
+    }
+    let _ = refresh_tray_menu(app);
+    let _ = app.emit("file-transfer-started", device_id);
+
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; FILE_CHUNK_BYTES];
+    let mut sent: u64 = 0;
+    let start_time = std::time::Instant::now();
+    let mut last_emit = start_time;
+
+    let outcome: Result<(), String> = (|| {
+        while sent < file_size {
+            if crate::network::session::outgoing_aborted(&transfer_id) {
+                return Err("peer aborted the transfer".to_string());
+            }
+            // Fill the buffer (File::read may return short reads); never read past
+            // the announced size if the file grows while sending.
+            let want = ((file_size - sent) as usize).min(FILE_CHUNK_BYTES);
+            let mut filled = 0;
+            while filled < want {
+                match file.read(&mut buffer[filled..want]) {
+                    Ok(0) => return Err("file shrank while sending".to_string()),
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(format!("read failed: {e}")),
+                }
+            }
+            hasher.update(&buffer[..filled]);
+            write_line_json(
+                &mut stream,
+                &ServerMessage::FileChunk {
+                    transfer_id: transfer_id.clone(),
+                    base64_data: STANDARD.encode(&buffer[..filled]),
+                },
+            )?;
+            sent += filled as u64;
+            if last_emit.elapsed() >= std::time::Duration::from_millis(150) {
+                last_emit = std::time::Instant::now();
+                update_send_progress(device_id, sent, start_time, state, app);
+            }
+        }
+        let sha256 = hasher.clone().finalize().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        write_line_json(
+            &mut stream,
+            &ServerMessage::FileEnd { transfer_id: transfer_id.clone(), sha256 },
+        )
+    })();
+
+    if let Err(e) = outcome {
+        let _ = write_line_json(&mut stream, &ServerMessage::FileAbort { transfer_id });
+        return Err(e);
+    }
+    println!("[file] Successfully sent '{}' to {}", file_name, device_id);
+    Ok(())
 }
 
 fn update_send_progress(
@@ -636,20 +586,19 @@ pub fn run() {
             ));
             let pairing = Arc::new(PairingManager::default());
             let tray_menu = Menu::new(app)?;
-            let terminal_server = crate::system::terminal::TerminalServerManager::start()
-                .map_err(setup_error)?;
             let state = AppState {
                 trusted_peers,
                 pairing,
                 broadcasting: Arc::new(AtomicBool::new(true)),
                 active_connections: Arc::new(Mutex::new(HashSet::new())),
                 active_streams: Arc::new(Mutex::new(HashMap::new())),
+                active_ips: Arc::new(Mutex::new(HashMap::new())),
                 last_clipboard: Arc::new(Mutex::new(String::new())),
                 copied_files: Arc::new(Mutex::new(Vec::new())),
                 clipboard_lock: Arc::new(Mutex::new(())),
                 tray_menu: tray_menu.clone(),
                 active_transfer: Arc::new(Mutex::new(None)),
-                terminal_server: Arc::new(Mutex::new(Some(terminal_server))),
+                terminal_server: Arc::new(Mutex::new(None)),
                 audio_stream_server: Arc::new(Mutex::new(None)),
                 virtual_camera_running: Arc::new(Mutex::new(None)),
                 latest_camera_frame: Arc::new(Mutex::new(None)),
@@ -893,18 +842,15 @@ pub fn run() {
             commands::device::get_active_transfer,
             commands::device::check_system_deps,
             commands::device::auto_install_system_dep,
-            commands::updater::install_update_linux,
             commands::updater::relaunch_app,
             commands::camera::get_camera_stream_state,
             commands::camera::toggle_camera_stream,
             commands::camera::update_camera_config,
             commands::camera::request_camera_config,
-            commands::camera::start_virtual_camera,
             commands::camera::stop_virtual_camera,
             commands::camera::get_latest_frame,
             commands::mic::get_mic_stream_state,
             commands::mic::toggle_mic_stream,
-            commands::mic::start_virtual_mic,
             commands::mic::stop_virtual_mic,
             commands::mic::set_virtual_mic_muted,
             commands::mic::set_virtual_mic_volume,

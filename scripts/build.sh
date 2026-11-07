@@ -60,9 +60,9 @@ fi
 echo "Building version: $VERSION"
 
 # 3. Define source and destination paths
-DEB_SRC="src-tauri/target/release/bundle/deb/Pzync_${VERSION}_amd64.deb"
+DEB_SRC="src-tauri/target/release/bundle/deb/SockLink_${VERSION}_amd64.deb"
 DEB_SIG_SRC="${DEB_SRC}.sig"
-WIN_SRC="src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/Pzync_${VERSION}_x64-setup.exe"
+WIN_SRC="src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/SockLink_${VERSION}_x64-setup.exe"
 WIN_SIG_SRC="${WIN_SRC}.sig"
 
 DEB_DEST="release/deb/app.deb"
@@ -121,7 +121,7 @@ DEB_SIG=$(cat "$DEB_SIG_DEST")
 cat <<INNER_EOF
     "linux-x86_64": {
       "signature": "$DEB_SIG",
-      "url": "https://github.com/pzynk/desktop/releases/download/v$VERSION/Pzync_${VERSION}_amd64.deb"
+      "url": "https://github.com/pzynk/desktop/releases/download/v$VERSION/SockLink_${VERSION}_amd64.deb"
     }$(if [ "$BUILD_WINDOWS" = true ]; then echo ","; else echo ""; fi)
 INNER_EOF
 fi)
@@ -130,7 +130,7 @@ WIN_SIG=$(cat "$WIN_SIG_DEST")
 cat <<INNER_EOF
     "windows-x86_64": {
       "signature": "$WIN_SIG",
-      "url": "https://github.com/pzynk/desktop/releases/download/v$VERSION/Pzync_${VERSION}_x64-setup.exe"
+      "url": "https://github.com/pzynk/desktop/releases/download/v$VERSION/SockLink_${VERSION}_x64-setup.exe"
     }
 INNER_EOF
 fi)

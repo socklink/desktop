@@ -75,7 +75,7 @@ function SettingsPage() {
                 <div>
                   <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--text-primary)' }}>Run at Startup</div>
                   <div style={{ fontSize: 12.5, color: 'var(--text-tertiary)', marginTop: 2 }}>
-                    Automatically launch Pzync background service when your computer boots up
+                    Automatically launch SockLink background service when your computer boots up
                   </div>
                 </div>
                 <button
@@ -162,7 +162,7 @@ function SettingsPage() {
           <section>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
               <Info size={18} style={{ color: 'var(--text-secondary)' }} />
-              <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)' }}>About Pzync</div>
+              <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-primary)' }}>About SockLink</div>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column' }}>
               {[

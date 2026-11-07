@@ -26,8 +26,10 @@
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use uuid::Uuid;
@@ -98,22 +100,130 @@ struct PersistentSession {
 
 type SessionMap = Arc<Mutex<HashMap<String, PersistentSession>>>;
 
+/// Max wrong-token attempts per source IP before it is locked out.
+const MAX_AUTH_FAILURES: u32 = 5;
+const LOCKOUT: Duration = Duration::from_secs(60);
+/// Unauthenticated sockets must finish the handshake within this time.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hard cap on the handshake line so an attacker cannot stream unbounded data.
+const MAX_HANDSHAKE_BYTES: u64 = 4096;
+
+struct Grant {
+    token: String,
+    peer_ip: IpAddr,
+}
+
+/// Per-device authorization state. A device can only authenticate if the desktop
+/// user enabled terminal access for it (a grant exists), from the IP of its
+/// control session, with its own random token.
+#[derive(Default)]
+struct GrantTable {
+    grants: Mutex<HashMap<String, Grant>>,
+    live: Mutex<HashMap<u64, (String, TcpStream)>>,
+    failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    next_conn: AtomicU64,
+}
+
+impl GrantTable {
+    fn grant(&self, device_id: &str, peer_ip: IpAddr) -> String {
+        let mut grants = self.grants.lock().unwrap();
+        if let Some(existing) = grants.get(device_id) {
+            if existing.peer_ip == peer_ip {
+                return existing.token.clone();
+            }
+        }
+        let token: String = rand::rng()
+            .sample_iter(&rand::distr::Alphanumeric)
+            .take(43)
+            .map(char::from)
+            .collect();
+        grants.insert(
+            device_id.to_string(),
+            Grant { token: token.clone(), peer_ip },
+        );
+        token
+    }
+
+    fn verify(&self, device_id: &str, token: &str, ip: IpAddr) -> bool {
+        let grants = self.grants.lock().unwrap();
+        grants
+            .get(device_id)
+            .map(|g| g.peer_ip == ip && constant_time_eq(g.token.as_bytes(), token.as_bytes()))
+            .unwrap_or(false)
+    }
+
+    /// Remove the grant and close every live connection that used it.
+    fn revoke(&self, device_id: &str) {
+        self.grants.lock().unwrap().remove(device_id);
+        let mut live = self.live.lock().unwrap();
+        live.retain(|_, (id, stream)| {
+            if id == device_id {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.grants.lock().unwrap().is_empty()
+    }
+
+    fn register_live(&self, device_id: &str, stream: TcpStream) -> u64 {
+        let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
+        self.live.lock().unwrap().insert(id, (device_id.to_string(), stream));
+        id
+    }
+
+    fn unregister_live(&self, id: u64) {
+        self.live.lock().unwrap().remove(&id);
+    }
+
+    fn is_locked_out(&self, ip: IpAddr) -> bool {
+        let mut f = self.failures.lock().unwrap();
+        match f.get(&ip) {
+            Some((n, since)) if *n >= MAX_AUTH_FAILURES => {
+                if since.elapsed() < LOCKOUT {
+                    true
+                } else {
+                    f.remove(&ip);
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn record_failure(&self, ip: IpAddr) {
+        let mut f = self.failures.lock().unwrap();
+        let entry = f.entry(ip).or_insert((0, Instant::now()));
+        entry.0 += 1;
+        entry.1 = Instant::now();
+    }
+
+    fn clear_failures(&self, ip: IpAddr) {
+        self.failures.lock().unwrap().remove(&ip);
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub struct TerminalServerManager {
     pub port: u16,
-    pub password: String,
-    #[allow(dead_code)]
+    table: Arc<GrantTable>,
     sessions: SessionMap,
     shutdown_tx: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 
 impl TerminalServerManager {
+    /// Start the listener. No device can authenticate until [`grant`] is called.
     pub fn start() -> Result<Self, String> {
-        let password: String = rand::rng()
-            .sample_iter(&rand::distr::Alphanumeric)
-            .take(16)
-            .map(char::from)
-            .collect();
-
         // Bind to a free port in 9600-9650 range
         let listener = {
             let mut p = 9600u16;
@@ -132,33 +242,55 @@ impl TerminalServerManager {
 
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+        let table = Arc::new(GrantTable::default());
+
+        // The public port speaks TLS; decrypted bytes reach the handler through a
+        // loopback listener together with the peer's real address.
+        let inner = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let inner_port = inner.local_addr().map_err(|e| e.to_string())?.port();
+        inner.set_nonblocking(true).ok();
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let stop = stop.clone();
+            let config = crate::network::tls::identity().config.clone();
+            std::thread::spawn(move || {
+                crate::network::tls::run_proxy(listener, inner_port, config, stop);
+            });
+        }
 
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
-        let pw_clone = password.clone();
+        let table_clone = table.clone();
         let sessions_clone = sessions.clone();
 
         std::thread::spawn(move || {
-            listener.set_nonblocking(true).ok();
             loop {
                 if shutdown_rx.try_recv().is_ok() {
+                    stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        let pw = pw_clone.clone();
+                match inner.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let table = table_clone.clone();
                         let sess = sessions_clone.clone();
                         std::thread::spawn(move || {
-                            if let Err(e) = handle_client(stream, pw, sess) {
+                            let remote_ip = match crate::network::tls::read_proxy_preamble(&mut stream) {
+                                Ok(ip) => ip,
+                                Err(e) => {
+                                    eprintln!("[terminal] rejected loopback connection: {e}");
+                                    return;
+                                }
+                            };
+                            if let Err(e) = handle_client(stream, remote_ip, table, sess) {
                                 eprintln!("[terminal] client handler error: {e}");
                             }
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                     Err(e) => {
                         eprintln!("[terminal] accept error: {e}");
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 }
             }
@@ -166,10 +298,26 @@ impl TerminalServerManager {
 
         Ok(Self {
             port,
-            password,
+            table,
             sessions,
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
         })
+    }
+
+    /// Authorize `device_id` (connecting from `peer_ip`) and return its private token.
+    /// Call only when the user enabled terminal access for this device.
+    pub fn grant(&self, device_id: &str, peer_ip: IpAddr) -> String {
+        self.table.grant(device_id, peer_ip)
+    }
+
+    /// Withdraw access: invalidate the token, close live connections, drop the shell.
+    pub fn revoke(&self, device_id: &str) {
+        self.table.revoke(device_id);
+        self.sessions.lock().unwrap().remove(device_id);
+    }
+
+    pub fn has_grants(&self) -> bool {
+        !self.table.is_empty()
     }
 }
 
@@ -187,7 +335,8 @@ impl Drop for TerminalServerManager {
 
 fn handle_client(
     stream: TcpStream,
-    password: String,
+    remote_ip: IpAddr,
+    table: Arc<GrantTable>,
     sessions: SessionMap,
 ) -> Result<(), String> {
     stream.set_nonblocking(false).map_err(|e| e.to_string())?;
@@ -195,30 +344,80 @@ fn handle_client(
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut writer = stream;
 
-    // Read Handshake
+    let reject = |w: &mut TcpStream| {
+        let res = serde_json::to_string(&ServerMsg::AuthResponse { ok: false }).unwrap();
+        let _ = writeln!(w, "{}", res);
+    };
+
+    if table.is_locked_out(remote_ip) {
+        reject(&mut writer);
+        return Err(format!("{remote_ip} is locked out after repeated auth failures"));
+    }
+
+    // Read Handshake (bounded in size and time)
+    writer
+        .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+        .map_err(|e| e.to_string())?;
     let mut handshake_line = String::new();
-    reader
+    (&mut reader)
+        .take(MAX_HANDSHAKE_BYTES)
         .read_line(&mut handshake_line)
         .map_err(|e| format!("failed to read handshake: {e}"))?;
 
-    let client_msg: ClientMsg = serde_json::from_str(&handshake_line)
-        .map_err(|e| format!("invalid handshake JSON: {e}"))?;
+    let client_msg: ClientMsg = match serde_json::from_str(&handshake_line) {
+        Ok(m) => m,
+        Err(e) => {
+            table.record_failure(remote_ip);
+            return Err(format!("invalid handshake JSON: {e}"));
+        }
+    };
 
     let (token, device_id) = match client_msg {
         ClientMsg::Auth { token, device_id } => (token, device_id),
         _ => {
-            let res = serde_json::to_string(&ServerMsg::AuthResponse { ok: false }).unwrap();
-            let _ = writeln!(writer, "{}", res);
+            table.record_failure(remote_ip);
+            reject(&mut writer);
             return Err("first message must be auth".to_string());
         }
     };
 
-    if token != password || device_id.is_empty() {
-        let res = serde_json::to_string(&ServerMsg::AuthResponse { ok: false }).unwrap();
-        let _ = writeln!(writer, "{}", res);
+    if device_id.is_empty() || !table.verify(&device_id, &token, remote_ip) {
+        table.record_failure(remote_ip);
+        reject(&mut writer);
         return Err("invalid auth token".to_string());
     }
+    table.clear_failures(remote_ip);
+    writer.set_read_timeout(None).map_err(|e| e.to_string())?;
 
+    // Track this connection so revoke() can close it immediately.
+    let conn_id = table.register_live(
+        &device_id,
+        writer.try_clone().map_err(|e| e.to_string())?,
+    );
+    let result = run_authenticated(
+        reader,
+        writer,
+        writer_for_actions,
+        table.clone(),
+        sessions,
+        device_id,
+        token,
+        remote_ip,
+    );
+    table.unregister_live(conn_id);
+    result
+}
+
+fn run_authenticated(
+    reader: BufReader<TcpStream>,
+    mut writer: TcpStream,
+    writer_for_actions: TcpStream,
+    table: Arc<GrantTable>,
+    sessions: SessionMap,
+    device_id: String,
+    token: String,
+    remote_ip: IpAddr,
+) -> Result<(), String> {
     // Auth Accepted
     let res = serde_json::to_string(&ServerMsg::AuthResponse { ok: true }).unwrap();
     writeln!(writer, "{}", res).map_err(|e| e.to_string())?;
@@ -346,11 +545,18 @@ fn handle_client(
     let mut socket_reader = reader;
     let cmd_tx = session.command_tx.clone();
     let int_tx = session.interrupt_tx.clone();
+    let table_for_reader = table.clone();
+    let device_id_for_reader = device_id.clone();
     std::thread::spawn(move || {
         let mut line = String::new();
         let mut writer = writer_for_actions;
         while socket_reader.read_line(&mut line).is_ok() {
             if line.is_empty() {
+                break;
+            }
+            // Access may have been revoked since the last message.
+            if !table_for_reader.verify(&device_id_for_reader, &token, remote_ip) {
+                let _ = writer.shutdown(std::net::Shutdown::Both);
                 break;
             }
             if let Ok(msg) = serde_json::from_str::<ClientMsg>(&line) {
@@ -405,6 +611,48 @@ fn handle_client(
     }
 
     Ok(())
+}
+
+/// Private (0700), uniquely named scratch directory that is removed on drop, so screen
+/// captures never sit in a predictable, world-readable path such as `/tmp/screenshot.png`.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new() -> Self {
+        use rand::RngExt as _;
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        loop {
+            let suffix: String = rand::rng()
+                .sample_iter(&rand::distr::Alphanumeric)
+                .take(12)
+                .map(char::from)
+                .collect();
+            let dir = base.join(format!("socklink-{suffix}"));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            // create (not create_all) fails if the name already exists, so a
+            // pre-planted directory or symlink is never reused.
+            if builder.create(&dir).is_ok() {
+                return Self(dir);
+            }
+        }
+    }
+
+    fn file(&self, name: &str) -> String {
+        self.0.join(name).to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 // ─── Session Helpers ───────────────────────────────────────────────────────────
@@ -894,7 +1142,9 @@ fn handle_action(
         "screenshot" => {
             #[cfg(all(unix, not(target_os = "macos")))]
             {
-                let output_path = "/tmp/screenshot.png";
+                let scratch = ScratchDir::new();
+                let output_path_owned = scratch.file("screenshot.png");
+                let output_path: &str = &output_path_owned;
                 let _ = std::fs::remove_file(output_path);
 
                 let mut captured = false;
@@ -903,7 +1153,7 @@ fn handle_action(
                 // 1. Try flameshot (extremely reliable on modern Wayland/X11 desktops)
                 let flameshot_res = std::process::Command::new("sh")
                     .arg("-c")
-                    .arg(format!("timeout 5 flameshot full -r > {}", output_path))
+                    .arg(format!("timeout 5 flameshot full -r > '{}'", output_path))
                     .output();
 
                 let is_valid_file = std::path::Path::new(output_path).exists()
@@ -999,7 +1249,9 @@ fn handle_action(
             }
             #[cfg(target_os = "macos")]
             {
-                let output_path = "/tmp/screenshot.png";
+                let scratch = ScratchDir::new();
+                let output_path_owned = scratch.file("screenshot.png");
+                let output_path: &str = &output_path_owned;
                 let result = std::process::Command::new("screencapture")
                     .arg("-x")
                     .arg(output_path)
@@ -1019,7 +1271,9 @@ fn handle_action(
             }
             #[cfg(target_os = "windows")]
             {
-                let output_path = "C:\\screenshot.png";
+                let scratch = ScratchDir::new();
+                let output_path_owned = scratch.file("screenshot.png");
+                let output_path: &str = &output_path_owned;
                 let result = std::process::Command::new("powershell")
                     .arg("-Command")
                     .arg(format!("[Windows.Graphics.Capture.ScreenCapture]::CaptureDisplay() | Export-Clixml -Path '{}'", output_path))
@@ -1122,5 +1376,79 @@ fn handle_action(
             }
         }
         _ => format!("✗ Unknown action: {}", action),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn no_grant_means_no_access() {
+        let t = GrantTable::default();
+        assert!(!t.verify("phone", "anything", ip("10.0.0.2")));
+    }
+
+    #[test]
+    fn grant_is_bound_to_device_token_and_ip() {
+        let t = GrantTable::default();
+        let tok = t.grant("phone-a", ip("10.0.0.2"));
+        assert!(t.verify("phone-a", &tok, ip("10.0.0.2")));
+        assert!(!t.verify("phone-a", "wrong", ip("10.0.0.2")));
+        assert!(!t.verify("phone-a", &tok, ip("10.0.0.99")), "other IP must fail");
+        assert!(!t.verify("phone-b", &tok, ip("10.0.0.2")), "other device must fail");
+    }
+
+    #[test]
+    fn tokens_are_unique_per_device() {
+        let t = GrantTable::default();
+        let a = t.grant("a", ip("10.0.0.2"));
+        let b = t.grant("b", ip("10.0.0.3"));
+        assert_ne!(a, b);
+        assert!(!t.verify("a", &b, ip("10.0.0.2")));
+    }
+
+    #[test]
+    fn revoke_invalidates_token() {
+        let t = GrantTable::default();
+        let tok = t.grant("a", ip("10.0.0.2"));
+        t.revoke("a");
+        assert!(!t.verify("a", &tok, ip("10.0.0.2")));
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn regrant_from_same_ip_reuses_token_but_new_ip_rotates() {
+        let t = GrantTable::default();
+        let a = t.grant("a", ip("10.0.0.2"));
+        assert_eq!(a, t.grant("a", ip("10.0.0.2")));
+        let b = t.grant("a", ip("10.0.0.5"));
+        assert_ne!(a, b);
+        assert!(!t.verify("a", &a, ip("10.0.0.2")));
+    }
+
+    #[test]
+    fn lockout_after_repeated_failures() {
+        let t = GrantTable::default();
+        let addr = ip("10.0.0.7");
+        for _ in 0..MAX_AUTH_FAILURES {
+            assert!(!t.is_locked_out(addr));
+            t.record_failure(addr);
+        }
+        assert!(t.is_locked_out(addr));
+        assert!(!t.is_locked_out(ip("10.0.0.8")));
+        t.clear_failures(addr);
+        assert!(!t.is_locked_out(addr));
+    }
+
+    #[test]
+    fn constant_time_eq_basics() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 }

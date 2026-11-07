@@ -174,10 +174,9 @@ function DeviceCameraRoute() {
 
     const loadStream = async () => {
       try {
-        const streamUrl = cameraConfig.useAdb
-          ? `http://127.0.0.1:40001/?t=${Date.now()}`
-          : `http://${cameraIp}:${cameraPort}/?t=${Date.now()}`
-        setFrameSrc(streamUrl)
+        // The phone's stream needs a secret that only the desktop backend holds, so the
+        // preview always comes from the local relay.
+        setFrameSrc(`http://127.0.0.1:40001/?t=${Date.now()}`)
       } catch (err) {
         console.error('Failed to initialize stream feed:', err)
         setPreviewError('Failed to initialize camera preview feed.')
@@ -433,11 +432,7 @@ function DeviceCameraRoute() {
                       if (nextCount < 15) {
                         setTimeout(() => {
                           if (cameraStreaming) {
-                            if (nextCount > 4 && cameraIp && cameraPort) {
-                              setFrameSrc(`http://${cameraIp}:${cameraPort}/?t=${Date.now()}`)
-                            } else {
-                              setFrameSrc(`http://127.0.0.1:40001/?t=${Date.now()}`)
-                            }
+                            setFrameSrc(`http://127.0.0.1:40001/?t=${Date.now()}`)
                           }
                         }, 500)
                       } else {

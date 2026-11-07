@@ -13,6 +13,10 @@ export function PairModal({ request, onResolve }: PairModalProps) {
         <div className="modal-title">{request.name}</div>
         <div className="modal-sub">
           Confirm the code below matches what's shown on the Android device before accepting.
+          Only accept if you started this pairing yourself.
+        </div>
+        <div className="modal-sub" style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+          From {request.ip}
         </div>
         <div className="modal-code" style={{ textShadow: 'none', color: 'var(--text-primary)' }}>
           {request.code.slice(0, 3)} {request.code.slice(3)}

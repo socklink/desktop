@@ -137,7 +137,7 @@ function RouteComponent() {
               </svg>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-              <span className="top-bar-logo-text" style={{ fontSize: 15, fontWeight: 700, letterSpacing: '-0.3px', lineHeight: 1.1 }}>Pzync</span>
+              <span className="top-bar-logo-text" style={{ fontSize: 15, fontWeight: 700, letterSpacing: '-0.3px', lineHeight: 1.1 }}>SockLink</span>
               <span style={{ fontSize: 9, fontWeight: 600, color: 'var(--text-tertiary)', letterSpacing: '0.6px', textTransform: 'uppercase', lineHeight: 1 }}>Desktop</span>
             </div>
           </div>
@@ -247,7 +247,7 @@ function RouteComponent() {
                     Autostart Disabled
                   </div>
                   <div style={{ fontSize: 12.5, color: 'var(--text-secondary)' }}>
-                    Pzync is not added to startup. Enable autostart so background sync connects automatically on boot.
+                    SockLink is not added to startup. Enable autostart so background sync connects automatically on boot.
                   </div>
                 </div>
               </div>
@@ -285,7 +285,7 @@ function RouteComponent() {
                 <div className="empty-state-icon"><Smartphone size={36} strokeWidth={1.5} /></div>
                 <div className="empty-state-text">No paired devices yet</div>
                 <div className="empty-state-sub">
-                  Open the Pzync app on your Android and scan for this desktop
+                  Open the SockLink app on your Android and scan for this desktop
                 </div>
               </div>
             ) : (

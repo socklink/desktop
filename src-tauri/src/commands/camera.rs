@@ -134,13 +134,14 @@ fn find_adb_path() -> String {
     adb_name.to_string()
 }
 
-#[tauri::command]
+/// Called from the network session (not exposed to the webview).
 pub async fn start_virtual_camera(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     ip: String,
     port: u16,
     use_adb: bool,
+    token: String,
 ) -> Result<(), String> {
     let mut running_guard = state.virtual_camera_running.lock().unwrap();
     if running_guard.is_some() {
@@ -287,7 +288,7 @@ pub async fn start_virtual_camera(
 
             println!("[camera] Connecting to camera stream (attempt {}/{})...", retry_count + 1, max_retries);
             
-            match run_virtual_camera_loop(app_handle.clone(), target_ip.clone(), target_port, latest_frame.clone(), preview_tx.clone(), &mut cancel_rx).await {
+            match run_virtual_camera_loop(app_handle.clone(), target_ip.clone(), target_port, token.clone(), latest_frame.clone(), preview_tx.clone(), &mut cancel_rx).await {
                 Ok(_) => {
                     println!("[camera] Virtual camera stream closed.");
                     break;
@@ -369,6 +370,7 @@ async fn run_virtual_camera_loop(
     app: tauri::AppHandle,
     ip: String,
     port: u16,
+    token: String,
     latest_frame: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     preview_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
     cancel_rx: &mut tokio::sync::oneshot::Receiver<()>,
@@ -382,8 +384,8 @@ async fn run_virtual_camera_loop(
         .map_err(|e| format!("Failed to connect to MJPEG server at {url}: {e}"))?;
 
     let request = format!(
-        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        url
+        "GET /{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        token, url
     );
     let write_future = stream.write_all(request.as_bytes());
     tokio::time::timeout(std::time::Duration::from_secs(5), write_future)

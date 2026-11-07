@@ -90,7 +90,7 @@ pub async fn toggle_mic_stream(
     }
 }
 
-#[tauri::command]
+/// Called from the network session (not exposed to the webview).
 pub async fn start_virtual_mic(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -99,6 +99,7 @@ pub async fn start_virtual_mic(
     sample_rate: u32,
     channels: u16,
     use_adb: bool,
+    token: String,
 ) -> Result<(), String> {
     let mut running_guard = state.virtual_mic_running.lock().unwrap();
     if running_guard.is_some() {
@@ -119,6 +120,7 @@ pub async fn start_virtual_mic(
         sample_rate,
         channels,
         use_adb,
+        token,
     )?;
 
     *running_guard = Some(mic);
